@@ -94,6 +94,10 @@ This removes the driver, configs, and restores the original `rtl8xxxu` driver.
 - Ubuntu 24.04 LTS, Kernel 6.17.0-14-generic, x86_64
 - NEXTU 202N Mini (USB `0bda:8179`, Realtek RTL8188EUS)
 
+## Disclaimer
+
+NEXTU is a trademark of its respective owner. This project is not affiliated with or endorsed by NEXTU. It provides open-source driver tooling for the Realtek RTL8188EUS chipset.
+
 ## License
 
 MIT
