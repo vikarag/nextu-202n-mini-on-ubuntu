@@ -214,10 +214,34 @@ iw phy | grep -A 10 "Supported interface modes"
 
 ## 5. Hotspot Configuration
 
-### 5.1 hostapd Configuration (`/etc/nextu-hotspot/hostapd.conf`)
+### 5.1 Dynamic Interface Detection
+
+The RTL8188EUS interface name is MAC-based (e.g., `wlx00ada70263bc`) and differs
+on every machine. The hotspot script detects the correct interface **at runtime**
+by scanning `/sys/class/net/wl*` for the USB vendor/product ID `0bda:8179`:
+
+```bash
+detect_interface() {
+    for dev in /sys/class/net/wl*; do
+        [ -e "$dev" ] || continue
+        local uevent=$(cat "$dev/device/uevent" 2>/dev/null)
+        if echo "$uevent" | grep -qi "0bda/8179"; then
+            basename "$dev"
+            return 0
+        fi
+    done
+    return 1
+}
+```
+
+The upstream (internet-sharing) interface is also detected dynamically via the
+default route. Both values are injected into the config files at start time,
+so no hardcoded interface names exist in the installed configuration.
+
+### 5.2 hostapd Configuration (`/etc/nextu-hotspot/hostapd.conf`)
 
 ```ini
-interface=wlx00ada70263bc
+interface=__IFACE__
 driver=nl80211
 ssid=NEXTU-Hotspot
 hw_mode=g
@@ -238,10 +262,13 @@ ignore_broadcast_ssid=0
 macaddr_acl=0
 ```
 
-### 5.2 dnsmasq Configuration (`/etc/nextu-hotspot/dnsmasq.conf`)
+The `__IFACE__` placeholder is replaced with the detected interface name each
+time `nextu-hotspot start` is run.
+
+### 5.3 dnsmasq Configuration (`/etc/nextu-hotspot/dnsmasq.conf`)
 
 ```ini
-interface=wlx00ada70263bc
+interface=__IFACE__
 bind-interfaces
 dhcp-range=192.168.50.10,192.168.50.50,255.255.255.0,24h
 dhcp-option=option:router,192.168.50.1
@@ -250,7 +277,7 @@ server=8.8.8.8
 server=8.8.4.4
 ```
 
-### 5.3 Regulatory Domain
+### 5.4 Regulatory Domain
 
 The wireless regulatory domain must be set for channels to be available in AP mode:
 
@@ -276,20 +303,26 @@ sudo nextu-hotspot status    # Show status and connected clients
 
 ### Start Sequence
 
-1. Disable NetworkManager control of the WiFi interface
-2. Set regulatory domain
-3. Configure IP address (192.168.50.1/24)
-4. Start hostapd (AP mode)
-5. Start dnsmasq (DHCP + DNS)
-6. Enable IP forwarding (`net.ipv4.ip_forward=1`)
-7. Configure iptables NAT (masquerade via upstream interface)
+1. **Auto-detect** the RTL8188EUS interface by USB ID (`0bda:8179`)
+2. **Auto-detect** the upstream internet interface via default route
+3. **Inject** detected interface name into hostapd.conf and dnsmasq.conf
+4. Disable NetworkManager control of the WiFi interface
+5. Set regulatory domain
+6. Configure IP address (192.168.50.1/24)
+7. Start hostapd (AP mode)
+8. Start dnsmasq (DHCP + DNS)
+9. Enable IP forwarding (`net.ipv4.ip_forward=1`)
+10. Configure iptables NAT (masquerade via upstream interface)
+11. Save detected interface/upstream to `/var/run/` for stop/status
 
 ### Stop Sequence
 
-1. Remove iptables NAT rules
-2. Stop dnsmasq
-3. Stop hostapd
-4. Reset interface and return to NetworkManager
+1. Read saved interface/upstream from `/var/run/` (or re-detect)
+2. Remove iptables NAT rules
+3. Stop dnsmasq
+4. Stop hostapd
+5. Reset interface and return to NetworkManager
+6. Clean up runtime state files
 
 ---
 

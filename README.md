@@ -50,7 +50,9 @@ sudo nextu-hotspot stop
 4. Builds and installs the driver via DKMS (survives kernel updates)
 5. Blacklists the old `rtl8xxxu` driver
 6. Interactively configures the hotspot (SSID, password, channel, country)
-7. Installs the `nextu-hotspot` management script
+7. Installs the `nextu-hotspot` management script with **automatic interface detection**
+
+> **Note**: The WiFi interface name (e.g., `wlx00ada70263bc`) is different on each machine because it is derived from the adapter's MAC address. The hotspot script automatically detects the correct interface by USB ID (`0bda:8179`) at runtime, so no manual configuration is needed.
 
 ## Hotspot Management
 

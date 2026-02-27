@@ -249,19 +249,17 @@ load_new_driver() {
 # ─── Hotspot Configuration ──────────────────────────────────────────────────
 
 install_hotspot_configs() {
-    local iface="$1"
-    local ssid="$2"
-    local password="$3"
-    local channel="$4"
-    local subnet="$5"
-    local country="$6"
-    local upstream="$7"
+    local ssid="$1"
+    local password="$2"
+    local channel="$3"
+    local subnet="$4"
+    local country="$5"
 
     mkdir -p "$CONF_DIR"
 
-    log_info "Writing hostapd configuration..."
+    log_info "Writing hostapd configuration template..."
     cat > "$CONF_DIR/hostapd.conf" << HOSTAPD_EOF
-interface=${iface}
+interface=__IFACE__
 driver=nl80211
 ssid=${ssid}
 hw_mode=g
@@ -282,9 +280,9 @@ ignore_broadcast_ssid=0
 macaddr_acl=0
 HOSTAPD_EOF
 
-    log_info "Writing dnsmasq configuration..."
+    log_info "Writing dnsmasq configuration template..."
     cat > "$CONF_DIR/dnsmasq.conf" << DNSMASQ_EOF
-interface=${iface}
+interface=__IFACE__
 bind-interfaces
 dhcp-range=${subnet}.10,${subnet}.50,255.255.255.0,24h
 dhcp-option=option:router,${subnet}.1
@@ -293,14 +291,12 @@ server=8.8.8.8
 server=8.8.4.4
 DNSMASQ_EOF
 
-    log_ok "Hotspot configuration written to $CONF_DIR/"
+    log_ok "Hotspot configuration written to $CONF_DIR/ (interface detected at runtime)"
 }
 
 install_hotspot_script() {
-    local iface="$1"
-    local subnet="$2"
-    local country="$3"
-    local upstream="$4"
+    local subnet="$1"
+    local country="$2"
 
     log_info "Installing hotspot management script..."
     cat > "$SCRIPT_PATH" << 'SCRIPT_EOF'
@@ -310,7 +306,8 @@ install_hotspot_script() {
 
 set -e
 
-IFACE="__IFACE__"
+USB_VENDOR="0bda"
+USB_PRODUCT="8179"
 HOSTAPD_BIN="/usr/sbin/hostapd"
 CONF_DIR="/etc/nextu-hotspot"
 HOSTAPD_CONF="$CONF_DIR/hostapd.conf"
@@ -319,19 +316,56 @@ HOSTAPD_PID="/var/run/nextu-hostapd.pid"
 DNSMASQ_PID="/var/run/nextu-dnsmasq.pid"
 SUBNET="__SUBNET__"
 GATEWAY="${SUBNET}.1"
-UPSTREAM="__UPSTREAM__"
 COUNTRY="__COUNTRY__"
+
+# ─── Dynamic Detection ────────────────────────────────────────────────────
+
+detect_interface() {
+    # Detect the RTL8188EUS wireless interface by USB product ID
+    for dev in /sys/class/net/wl*; do
+        [ -e "$dev" ] || continue
+        local uevent=$(cat "$dev/device/uevent" 2>/dev/null)
+        # Match by USB vendor/product ID (works regardless of driver loaded)
+        if echo "$uevent" | grep -qi "${USB_VENDOR}/${USB_PRODUCT}\|PRODUCT=${USB_VENDOR}"; then
+            basename "$dev"
+            return 0
+        fi
+        # Also match by driver name
+        if echo "$uevent" | grep -q "8188eu\|rtl8xxxu"; then
+            basename "$dev"
+            return 0
+        fi
+    done
+    return 1
+}
+
+detect_upstream() {
+    # Find the primary internet-connected interface
+    ip route show default 2>/dev/null | awk '/default/{print $5}' | head -1
+}
+
+resolve_interface() {
+    local iface
+    iface=$(detect_interface) || true
+    if [ -z "$iface" ]; then
+        echo "Error: NEXTU 202N adapter not found. Is it plugged in?" >&2
+        echo "  Expected: USB device ${USB_VENDOR}:${USB_PRODUCT} (RTL8188EUS)" >&2
+        echo "  Check with: lsusb | grep ${USB_VENDOR}:${USB_PRODUCT}" >&2
+        exit 1
+    fi
+    echo "$iface"
+}
+
+inject_interface() {
+    # Replace __IFACE__ placeholder in config files with the detected interface
+    local iface="$1"
+    sed -i "s|^interface=.*|interface=${iface}|" "$HOSTAPD_CONF"
+    sed -i "s|^interface=.*|interface=${iface}|" "$DNSMASQ_CONF"
+}
 
 check_root() {
     if [ "$(id -u)" -ne 0 ]; then
         echo "Error: This script must be run as root (sudo)"
-        exit 1
-    fi
-}
-
-check_interface() {
-    if ! ip link show "$IFACE" &>/dev/null; then
-        echo "Error: Interface $IFACE not found. Is the NEXTU 202N plugged in?"
         exit 1
     fi
 }
@@ -344,7 +378,20 @@ start_hotspot() {
         exit 1
     fi
 
-    check_interface
+    # Detect interface and upstream at runtime
+    local IFACE=$(resolve_interface)
+    local UPSTREAM=$(detect_upstream)
+    if [ -z "$UPSTREAM" ]; then
+        echo "Error: No internet-connected interface found for NAT."
+        echo "  Ensure you have a wired ethernet connection."
+        exit 1
+    fi
+
+    echo "  Detected WiFi interface: $IFACE"
+    echo "  Detected upstream:       $UPSTREAM"
+
+    # Inject detected interface into config files
+    inject_interface "$IFACE"
 
     # Set regulatory domain for channel availability
     iw reg set "$COUNTRY" 2>/dev/null || true
@@ -389,8 +436,13 @@ start_hotspot() {
     iptables -A FORWARD -i "$IFACE" -o "$UPSTREAM" -j ACCEPT
     iptables -A FORWARD -i "$UPSTREAM" -o "$IFACE" -m state --state RELATED,ESTABLISHED -j ACCEPT
 
+    # Save detected values for stop/status commands
+    echo "$IFACE" > /var/run/nextu-hotspot-iface
+    echo "$UPSTREAM" > /var/run/nextu-hotspot-upstream
+
     echo ""
     echo "=== Hotspot is ACTIVE ==="
+    echo "  Interface: $IFACE"
     echo "  SSID:      $(grep '^ssid=' "$HOSTAPD_CONF" | cut -d= -f2)"
     echo "  Password:  $(grep '^wpa_passphrase=' "$HOSTAPD_CONF" | cut -d= -f2)"
     echo "  Gateway:   $GATEWAY"
@@ -403,10 +455,25 @@ start_hotspot() {
 stop_hotspot() {
     echo "=== Stopping NEXTU 202N Hotspot ==="
 
+    # Read saved interface/upstream from start, or detect fresh
+    local IFACE UPSTREAM
+    if [ -f /var/run/nextu-hotspot-iface ]; then
+        IFACE=$(cat /var/run/nextu-hotspot-iface)
+    else
+        IFACE=$(detect_interface) || IFACE=""
+    fi
+    if [ -f /var/run/nextu-hotspot-upstream ]; then
+        UPSTREAM=$(cat /var/run/nextu-hotspot-upstream)
+    else
+        UPSTREAM=$(detect_upstream)
+    fi
+
     echo "[1/4] Removing NAT rules..."
-    iptables -t nat -D POSTROUTING -o "$UPSTREAM" -j MASQUERADE 2>/dev/null || true
-    iptables -D FORWARD -i "$IFACE" -o "$UPSTREAM" -j ACCEPT 2>/dev/null || true
-    iptables -D FORWARD -i "$UPSTREAM" -o "$IFACE" -m state --state RELATED,ESTABLISHED -j ACCEPT 2>/dev/null || true
+    if [ -n "$UPSTREAM" ] && [ -n "$IFACE" ]; then
+        iptables -t nat -D POSTROUTING -o "$UPSTREAM" -j MASQUERADE 2>/dev/null || true
+        iptables -D FORWARD -i "$IFACE" -o "$UPSTREAM" -j ACCEPT 2>/dev/null || true
+        iptables -D FORWARD -i "$UPSTREAM" -o "$IFACE" -m state --state RELATED,ESTABLISHED -j ACCEPT 2>/dev/null || true
+    fi
 
     echo "[2/4] Stopping DHCP server..."
     if [ -f "$DNSMASQ_PID" ]; then
@@ -421,16 +488,39 @@ stop_hotspot() {
     fi
 
     echo "[4/4] Resetting interface..."
-    ip addr flush dev "$IFACE" 2>/dev/null || true
-    ip link set "$IFACE" down 2>/dev/null || true
-    nmcli device set "$IFACE" managed yes 2>/dev/null || true
+    if [ -n "$IFACE" ]; then
+        ip addr flush dev "$IFACE" 2>/dev/null || true
+        ip link set "$IFACE" down 2>/dev/null || true
+        nmcli device set "$IFACE" managed yes 2>/dev/null || true
+    fi
 
+    rm -f /var/run/nextu-hotspot-iface /var/run/nextu-hotspot-upstream
     echo "=== Hotspot stopped ==="
 }
 
 show_status() {
     echo "=== NEXTU 202N Hotspot Status ==="
     echo ""
+
+    # Use saved interface if running, otherwise detect
+    local IFACE UPSTREAM
+    if [ -f /var/run/nextu-hotspot-iface ]; then
+        IFACE=$(cat /var/run/nextu-hotspot-iface)
+    else
+        IFACE=$(detect_interface) || IFACE=""
+    fi
+    if [ -f /var/run/nextu-hotspot-upstream ]; then
+        UPSTREAM=$(cat /var/run/nextu-hotspot-upstream)
+    else
+        UPSTREAM=$(detect_upstream)
+    fi
+
+    if [ -z "$IFACE" ]; then
+        echo "Interface: NOT DETECTED"
+        echo "  NEXTU 202N adapter may not be plugged in."
+        echo "  Check with: lsusb | grep ${USB_VENDOR}:${USB_PRODUCT}"
+        return
+    fi
 
     if ip link show "$IFACE" &>/dev/null; then
         echo "Interface: $IFACE (FOUND)"
@@ -459,7 +549,7 @@ show_status() {
         echo "DHCP:      STOPPED"
     fi
 
-    if iptables -t nat -C POSTROUTING -o "$UPSTREAM" -j MASQUERADE 2>/dev/null; then
+    if [ -n "$UPSTREAM" ] && iptables -t nat -C POSTROUTING -o "$UPSTREAM" -j MASQUERADE 2>/dev/null; then
         echo "NAT:       ACTIVE (via $UPSTREAM)"
     else
         echo "NAT:       INACTIVE"
@@ -502,10 +592,8 @@ case "${1:-}" in
 esac
 SCRIPT_EOF
 
-    # Replace placeholders with actual values
-    sed -i "s|__IFACE__|${iface}|g" "$SCRIPT_PATH"
+    # Replace only subnet and country placeholders (interface is detected at runtime)
     sed -i "s|__SUBNET__|${subnet}|g" "$SCRIPT_PATH"
-    sed -i "s|__UPSTREAM__|${upstream}|g" "$SCRIPT_PATH"
     sed -i "s|__COUNTRY__|${country}|g" "$SCRIPT_PATH"
 
     chmod +x "$SCRIPT_PATH"
@@ -515,31 +603,26 @@ SCRIPT_EOF
 # ─── Interactive Configuration ───────────────────────────────────────────────
 
 interactive_configure() {
-    local iface=$(detect_interface)
-    local upstream=$(get_upstream_interface)
-
     echo ""
     echo "=== NEXTU 202N Hotspot Configuration ==="
     echo ""
 
-    # Interface
+    # Show detection info (for user's reference only — not baked into configs)
+    local iface=$(detect_interface)
     if [ -n "$iface" ]; then
-        echo "Detected WiFi interface: $iface"
+        log_ok "Detected WiFi interface: $iface (will be auto-detected at runtime)"
     else
-        iface="wlx00ada70263bc"
-        echo "Could not detect interface, using default: $iface"
+        log_warn "Adapter not detected now, but will be auto-detected when hotspot starts"
     fi
-    read -rp "WiFi interface [$iface]: " input
-    iface="${input:-$iface}"
 
-    # Upstream
+    local upstream=$(get_upstream_interface)
     if [ -n "$upstream" ]; then
-        echo "Detected upstream interface: $upstream"
+        log_ok "Detected upstream interface: $upstream (will be auto-detected at runtime)"
     else
-        upstream="enp1s0"
+        log_warn "No upstream detected now, but will be auto-detected when hotspot starts"
     fi
-    read -rp "Internet interface [$upstream]: " input
-    upstream="${input:-$upstream}"
+
+    echo ""
 
     # SSID
     read -rp "Hotspot SSID [$DEFAULT_SSID]: " input
@@ -565,8 +648,8 @@ interactive_configure() {
 
     echo ""
     echo "Configuration:"
-    echo "  Interface:  $iface"
-    echo "  Upstream:   $upstream"
+    echo "  Interface:  (auto-detected at runtime)"
+    echo "  Upstream:   (auto-detected at runtime)"
     echo "  SSID:       $ssid"
     echo "  Password:   $password"
     echo "  Channel:    $channel"
@@ -580,8 +663,8 @@ interactive_configure() {
         exit 0
     fi
 
-    install_hotspot_configs "$iface" "$ssid" "$password" "$channel" "$subnet" "$country" "$upstream"
-    install_hotspot_script "$iface" "$subnet" "$country" "$upstream"
+    install_hotspot_configs "$ssid" "$password" "$channel" "$subnet" "$country"
+    install_hotspot_script "$subnet" "$country"
 
     echo ""
     log_ok "Configuration complete!"
